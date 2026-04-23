@@ -74,7 +74,7 @@ const payload = JSON.stringify({
 // MAIN TEST FUNCTION
 // ============================================================
 export default function () {
-  const res = http.get(`${BASE_URL}`, {
+  const res = http.post(`${BASE_URL}`, {
     headers,
     body: payload,
     timeout: '10s', // request timeout 10 detik

@@ -34,13 +34,30 @@ const headers = {
   'Authorization': `Bearer ${BEARER_TOKEN}`,
 };
 
+// Request body sesuai API inquiry burn
+const payload = JSON.stringify({
+  loyaltyMemberId: 'KAI00000605',
+  productCode: '123PROM',
+  storeCode: 'A',
+  companyCode: 'KAI',
+  productPrice: 20000,
+  burnType: 'PAYFULL',
+  additionalData: {
+    origin: 'BANDUNG',
+    destination: 'MANGGARAI',
+    trainName: 'ARGO PARAHYANGAN',
+    test: 'Test',
+  },
+});
+
 export default function () {
-  const res = http.get(`${BASE_URL}`, { headers });
+  // GET dengan JSON body
+  const res = http.get(`${BASE_URL}`, { headers, body: payload });
 
   const success = check(res, {
     'status is 200': (r) => r.status === 200,
     'response time < 2s': (r) => r.timings.duration < 2000,
-    'no error in body': (r) => !r.body.includes('error'),
+    'no error in body': (r) => !r.body.toLowerCase().includes('error'),
   });
 
   // Track custom metrics

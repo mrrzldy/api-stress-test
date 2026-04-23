@@ -74,11 +74,13 @@ const payload = JSON.stringify({
 // MAIN TEST FUNCTION
 // ============================================================
 export default function () {
-  const res = http.post(`${BASE_URL}`, {
-    headers,
-    body: payload,
-    timeout: '10s', // request timeout 10 detik
-  });
+const res = http.post(`${BASE_URL}`, payload, {
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${BEARER_TOKEN}`,
+  },
+  timeout: '10s',
+});
 
   // Deteksi timeout (status 0 = network error / timeout)
   const isTimeout = res.status === 0;

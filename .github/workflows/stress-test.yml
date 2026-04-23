@@ -1,7 +1,6 @@
 name: 🔥 API Stress Test
 
 on:
-  # Manual trigger dari GitHub UI — tim tinggal klik "Run workflow" & isi form
   workflow_dispatch:
     inputs:
       target_url:
@@ -25,7 +24,6 @@ on:
         required: true
         default: 'true'
 
-  # Bisa juga di-trigger via API (dari Apps Script Google Sheet)
   repository_dispatch:
     types: [run-stress-test]
 
@@ -51,9 +49,7 @@ jobs:
           sudo apt-get install k6 -y
 
       - name: 🔧 Set parameters
-        id: params
         run: |
-          # Support trigger dari workflow_dispatch maupun repository_dispatch (Apps Script)
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "TARGET_URL=${{ github.event.client_payload.target_url }}" >> $GITHUB_ENV
             echo "VIRTUAL_USERS=${{ github.event.client_payload.virtual_users }}" >> $GITHUB_ENV
@@ -69,7 +65,6 @@ jobs:
           fi
 
       - name: 🚀 Run k6 Stress Test
-        id: k6_run
         env:
           TARGET_URL: ${{ env.TARGET_URL }}
           BEARER_TOKEN: ${{ secrets.DEV_BEARER_TOKEN }}
@@ -77,20 +72,34 @@ jobs:
           DURATION: ${{ env.DURATION }}
           RAMP_DURATION: ${{ env.RAMP_DURATION }}
         run: |
-          # Jalankan k6, capture output
+          # Jalankan k6, simpan output ke file
           k6 run \
             --env TARGET_URL="$TARGET_URL" \
             --env BEARER_TOKEN="$BEARER_TOKEN" \
             --env VIRTUAL_USERS="$VIRTUAL_USERS" \
             --env DURATION="$DURATION" \
             --env RAMP_DURATION="$RAMP_DURATION" \
-            k6-script.js 2>&1 | tee k6_output.txt
+            k6-script.js 2>&1 | tee k6_output.txt || true
 
-          # Extract JSON summary dari output
-          grep 'K6_SUMMARY_JSON=' k6_output.txt | sed 's/K6_SUMMARY_JSON=//' > summary.json || echo '{}' > summary.json
-          echo "summary=$(cat summary.json)" >> $GITHUB_OUTPUT
+          # k6 nulis summary.json langsung via handleSummary
+          # Kalau gak ada, bikin fallback dari output log
+          if [ ! -f summary.json ] || [ ! -s summary.json ]; then
+            echo "⚠️ summary.json kosong, coba extract dari log..."
+            grep 'K6_SUMMARY_JSON=' k6_output.txt \
+              | tail -1 \
+              | sed 's/.*K6_SUMMARY_JSON=//' > summary.json || true
+          fi
+
+          # Kalau masih kosong, bikin dummy biar gak error
+          if [ ! -s summary.json ]; then
+            echo '{"status":"FAIL","fail_reasons":"k6 did not produce summary","target_url":"'$TARGET_URL'","virtual_users":"'$VIRTUAL_USERS'","duration":"'$DURATION'","total_requests":0,"req_per_second":"0","success_count":0,"fail_count":0,"timeout_count":0,"error_4xx_count":0,"error_5xx_count":0,"error_rate_pct":"100","timeout_rate_pct":"0","avg_response_ms":"0","p95_response_ms":"0","p99_response_ms":"0","min_response_ms":"0","max_response_ms":"0","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > summary.json
+          fi
+
+          echo "=== summary.json ==="
+          cat summary.json
 
       - name: 📊 Upload hasil sebagai artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stress-test-results-${{ github.run_id }}
@@ -100,31 +109,38 @@ jobs:
           retention-days: 30
 
       - name: 📤 Kirim hasil ke Google Sheet
-        if: env.NOTIFY_SHEET == 'true'
+        if: always()
         env:
           SHEET_WEBHOOK_URL: ${{ secrets.GOOGLE_SHEET_WEBHOOK_URL }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          SUMMARY=$(cat summary.json)
+          python3 - << 'PYEOF'
+          import json, os, urllib.request
 
-          # Inject run_id dan run_url ke summary
-          PAYLOAD=$(echo "$SUMMARY" | \
-            python3 -c "
-          import json, sys, os
-          d = json.load(sys.stdin)
-          d['run_id'] = os.environ['RUN_ID']
-          d['run_url'] = os.environ['RUN_URL']
-          print(json.dumps(d))
-          ")
+          with open('summary.json', 'r') as f:
+            data = json.load(f)
 
-          curl -s -X POST "$SHEET_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+          data['run_id']  = os.environ['RUN_ID']
+          data['run_url'] = os.environ['RUN_URL']
+
+          payload = json.dumps(data).encode('utf-8')
+          webhook = os.environ['SHEET_WEBHOOK_URL']
+
+          req = urllib.request.Request(
+            webhook,
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+          )
+          with urllib.request.urlopen(req) as resp:
+            print(f"Sheet webhook response: {resp.status}")
+          PYEOF
 
       - name: ✅ Print Summary
+        if: always()
         run: |
           echo "=============================="
           echo "  STRESS TEST SUMMARY"
           echo "=============================="
-          cat summary.json | python3 -m json.tool || cat summary.json
+          python3 -m json.tool summary.json || cat summary.json

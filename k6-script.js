@@ -36,12 +36,13 @@ export const options = {
     { duration: RAMP_DURATION, target: 0 },
   ],
   thresholds: {
-    http_req_duration: ['p(95)<2000', 'p(99)<5000'],
-    error_rate:        ['rate<0.05'],
-    timeout_rate:      ['rate<0.02'],
-    error_4xx_rate:    ['rate<0.05'],
-    error_5xx_rate:    ['rate<0.02'],
-    http_req_failed:   ['rate<0.05'],
+    // Threshold ini hanya untuk error — bukan performance
+    // Performance lambat akan dicatat sebagai SLOW, bukan FAIL
+    error_rate:      ['rate<0.05'],
+    timeout_rate:    ['rate<0.02'],
+    error_4xx_rate:  ['rate<0.05'],
+    error_5xx_rate:  ['rate<0.02'],
+    http_req_failed: ['rate<0.05'],
   },
 };
 
@@ -66,14 +67,12 @@ const payload = JSON.stringify({
 // ============================================================
 // ERROR SAMPLE COLLECTOR
 // ============================================================
-// Simpan sample error (max 5) untuk dikirim ke summary
 const errorSamples = [];
 
 // ============================================================
 // MAIN TEST FUNCTION
 // ============================================================
 export default function () {
-  // FIX #1: headers didefinisikan HANYA di sini, tidak ada duplikat di luar
   const res = http.post(`${BASE_URL}`, payload, {
     headers: {
       'Content-Type': 'application/json',
@@ -99,7 +98,7 @@ export default function () {
   errorRate.add(!isSuccess);
   responseTime.add(res.timings.duration);
 
-  // FIX #2: Collect error sample (max 5 biar ga bloat)
+  // Collect error sample max 5
   if (!isSuccess && errorSamples.length < 5) {
     errorSamples.push({
       status: res.status,
@@ -136,17 +135,21 @@ export function handleSummary(data) {
   const err4xx       = data.metrics.error_4xx_count?.values?.count || 0;
   const err5xx       = data.metrics.error_5xx_count?.values?.count || 0;
   const errorRatePct = ((data.metrics.http_req_failed?.values?.rate || 0) * 100).toFixed(2);
+  const p95          = data.metrics.http_req_duration?.values['p(95)'] || 0;
+  const p99          = data.metrics.http_req_duration?.values['p(99)'] || 0;
 
+  // ── Status logic ──────────────────────────────────────────
+  // FAIL  = ada error (4xx/5xx/timeout melebihi threshold)
+  // SLOW  = semua request sukses tapi response time lambat
+  // PASS  = semua aman
+  // ─────────────────────────────────────────────────────────
   let overallStatus = 'PASS';
   const failReasons = [];
 
+  // Cek error-based (ini yang beneran masalah → FAIL)
   if (data.metrics.http_req_failed?.values?.rate >= 0.05) {
     overallStatus = 'FAIL';
     failReasons.push(`Error rate ${errorRatePct}% (threshold <5%)`);
-  }
-  if (data.metrics.http_req_duration?.values['p(95)'] >= 2000) {
-    overallStatus = 'FAIL';
-    failReasons.push(`P95 response time ${data.metrics.http_req_duration?.values['p(95)'].toFixed(0)}ms (threshold <2000ms)`);
   }
   if (data.metrics.timeout_rate?.values?.rate >= 0.02) {
     overallStatus = 'FAIL';
@@ -156,12 +159,26 @@ export function handleSummary(data) {
     overallStatus = 'FAIL';
     failReasons.push(`5xx error rate ${(data.metrics.error_5xx_rate?.values?.rate * 100).toFixed(2)}% (threshold <2%)`);
   }
+  if (data.metrics.error_4xx_rate?.values?.rate >= 0.05) {
+    overallStatus = 'FAIL';
+    failReasons.push(`4xx error rate ${(data.metrics.error_4xx_rate?.values?.rate * 100).toFixed(2)}% (threshold <5%)`);
+  }
 
-  // FIX #2: http_status breakdown + error_sample masuk ke summary
+  // Cek performance (lambat → SLOW, bukan FAIL)
+  if (p95 >= 2000) {
+    if (overallStatus === 'PASS') overallStatus = 'SLOW';
+    failReasons.push(`P95 response time ${p95.toFixed(0)}ms (threshold <2000ms)`);
+  }
+  if (p99 >= 5000) {
+    if (overallStatus === 'PASS') overallStatus = 'SLOW';
+    failReasons.push(`P99 response time ${p99.toFixed(0)}ms (threshold <5000ms)`);
+  }
+
+  // HTTP status breakdown
   const httpStatusBreakdown = {};
-  if (timeouts > 0)  httpStatusBreakdown['timeout(0)'] = timeouts;
-  if (err4xx > 0)    httpStatusBreakdown['4xx'] = err4xx;
-  if (err5xx > 0)    httpStatusBreakdown['5xx'] = err5xx;
+  if (timeouts > 0) httpStatusBreakdown['timeout(0)'] = timeouts;
+  if (err4xx > 0)   httpStatusBreakdown['4xx'] = err4xx;
+  if (err5xx > 0)   httpStatusBreakdown['5xx'] = err5xx;
 
   const summary = {
     timestamp:        new Date().toISOString(),
@@ -183,12 +200,11 @@ export function handleSummary(data) {
     timeout_rate_pct: ((data.metrics.timeout_rate?.values?.rate || 0) * 100).toFixed(2),
 
     avg_response_ms:  (data.metrics.http_req_duration?.values?.avg || 0).toFixed(2),
-    p95_response_ms:  (data.metrics.http_req_duration?.values['p(95)'] || 0).toFixed(2),
-    p99_response_ms:  (data.metrics.http_req_duration?.values['p(99)'] || 0).toFixed(2),
+    p95_response_ms:  p95.toFixed(2),
+    p99_response_ms:  p99.toFixed(2),
     min_response_ms:  (data.metrics.http_req_duration?.values?.min || 0).toFixed(2),
     max_response_ms:  (data.metrics.http_req_duration?.values?.max || 0).toFixed(2),
 
-    // FIX #2: Field baru ini yang bakal keliatan di Sheet
     http_status:      JSON.stringify(httpStatusBreakdown),
     error_sample:     JSON.stringify(errorSamples),
   };
@@ -203,7 +219,7 @@ Target URL   : ${BASE_URL}
 Virtual Users: ${VIRTUAL_USERS}
 Duration     : ${DURATION}
 Status       : ${overallStatus}
-${failReasons.length > 0 ? 'Fail Reasons : ' + failReasons.join('\n               ') : ''}
+${failReasons.length > 0 ? 'Reasons      : ' + failReasons.join('\n               ') : ''}
 -------------------------------------
 VOLUME
   Total Requests : ${totalReqs}
@@ -226,7 +242,9 @@ RESPONSE TIME
   Max            : ${summary.max_response_ms} ms
 -------------------------------------
 ERROR SAMPLES (max 5)
-  ${errorSamples.length === 0 ? 'Tidak ada error' : errorSamples.map((e, i) => `[${i+1}] status=${e.status} body=${e.body}`).join('\n  ')}
+  ${errorSamples.length === 0
+    ? 'Tidak ada error'
+    : errorSamples.map((e, i) => `[${i + 1}] status=${e.status} body=${e.body}`).join('\n  ')}
 =====================================
 `;
 

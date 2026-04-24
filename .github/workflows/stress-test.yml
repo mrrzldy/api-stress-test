@@ -143,68 +143,97 @@ jobs:
           def section_title(title):
               return f'<h2 style="font-size:14px;font-weight:700;color:#111827;border-left:4px solid #2563eb;padding-left:10px;margin:28px 0 14px;">{title}</h2>'
 
-          def table_row(label, value, highlight=False):
-              bg = '#fffbeb' if highlight else 'white'
-              return f'<tr style="background:{bg};"><td style="padding:9px 14px;color:#374151;font-size:12px;border-bottom:1px solid #f3f4f6;">{label}</td><td style="padding:9px 14px;color:#111827;font-weight:600;font-size:12px;border-bottom:1px solid #f3f4f6;text-align:right;">{value}</td></tr>'
+          def threshold_status(value, threshold, mode='lt'):
+              ok = value < threshold if mode == 'lt' else value > threshold
+              if ok:
+                  return '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'
+              else:
+                  return '<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>'
 
-          # ── interpretasi otomatis ─────────────────────────────────
-          status      = d.get('status', 'FAIL')
-          p95         = float(d.get('p95_response_ms', 0))
-          avg         = float(d.get('avg_response_ms', 0))
-          error_pct   = float(d.get('error_rate_pct', 0))
-          timeout_pct = float(d.get('timeout_rate_pct', 0))
-          total_req   = int(d.get('total_requests', 0))
-          success     = int(d.get('success_count', 0))
-          fail_count  = int(d.get('fail_count', 0))
-          vu          = d.get('virtual_users', '-')
-          duration    = d.get('duration', '-')
-          rps         = d.get('req_per_second', '0')
+          def slow_or_fail(value, threshold):
+              if value < threshold:
+                  return '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'
+              elif value < threshold * 1.5:
+                  return '<span style="color:#b45309;font-weight:600;">⚠ SLOW</span>'
+              else:
+                  return '<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>'
 
-          success_rate = round((success / total_req * 100), 2) if total_req > 0 else 0
+          # ── metrics ───────────────────────────────────────────────
+          status       = d.get('status', 'FAIL')
+          p95          = float(d.get('p95_response_ms', 0))
+          p99          = float(d.get('p99_response_ms', 0))
+          avg          = float(d.get('avg_response_ms', 0))
+          min_ms       = float(d.get('min_response_ms', 0))
+          max_ms       = float(d.get('max_response_ms', 0))
+          error_pct    = float(d.get('error_rate_pct', 0))
+          timeout_pct  = float(d.get('timeout_rate_pct', 0))
+          total_req    = int(d.get('total_requests', 0))
+          success      = int(d.get('success_count', 0))
+          fail_count   = int(d.get('fail_count', 0))
+          timeout_cnt  = int(d.get('timeout_count', 0))
+          err4xx       = int(d.get('error_4xx_count', 0))
+          err5xx       = int(d.get('error_5xx_count', 0))
+          vu           = d.get('virtual_users', '-')
+          duration     = d.get('duration', '-')
+          rps          = d.get('req_per_second', '0')
 
-          # Kesimpulan & rekomendasi otomatis
-          conclusions  = []
-          recommends   = []
+          # FIX: success rate dihitung dari actual success, bukan dari failed flag
+          actual_failed   = timeout_cnt + err4xx + err5xx
+          actual_success  = total_req - actual_failed
+          success_rate    = round((actual_success / total_req * 100), 2) if total_req > 0 else 0
+
+          # FIX: rate per error type dihitung sendiri
+          timeout_rate_pct = round((timeout_cnt / total_req * 100), 2) if total_req > 0 else 0
+          err4xx_rate_pct  = round((err4xx / total_req * 100), 2) if total_req > 0 else 0
+          err5xx_rate_pct  = round((err5xx / total_req * 100), 2) if total_req > 0 else 0
+
+          # ── kesimpulan & rekomendasi ──────────────────────────────
+          conclusions = []
+          recommends  = []
 
           if status == 'PASS':
-              conclusions.append(f'API merespons dengan baik di bawah beban {vu} concurrent users selama {duration}.')
-              conclusions.append(f'Seluruh {total_req:,} request berhasil dengan success rate {success_rate}%.')
+              conclusions.append(f'API merespons dengan baik di bawah beban <b>{vu} concurrent users</b> selama <b>{duration}</b>.')
+              conclusions.append(f'Seluruh <b>{total_req:,} request</b> berhasil dengan success rate <b>{success_rate}%</b>.')
               if p95 < 1000:
-                  conclusions.append(f'Response time sangat baik — 95% request selesai dalam {p95:.0f}ms.')
+                  conclusions.append(f'Response time sangat baik — 95% request selesai dalam <b>{p95:.0f}ms</b>.')
               else:
-                  conclusions.append(f'Response time masih dalam batas — P95 {p95:.0f}ms di bawah threshold 2000ms.')
-              recommends.append('API siap untuk beban normal. Pertimbangkan untuk menaikkan VU secara bertahap untuk mengetahui batas kapasitas.')
+                  conclusions.append(f'Response time dalam batas aman — P95 <b>{p95:.0f}ms</b> masih di bawah threshold 2000ms.')
+              recommends.append('API siap untuk beban normal. Pertimbangkan menaikkan VU secara bertahap untuk mengetahui batas kapasitas.')
+              recommends.append('Dengan konfigurasi <b>minReplicas: 2 / maxReplicas: 5</b>, pastikan HPA (Horizontal Pod Autoscaler) aktif dan responsif terhadap kenaikan load.')
               recommends.append('Lakukan stress test rutin untuk memastikan performa tidak degradasi seiring penambahan fitur.')
 
           elif status == 'SLOW':
-              conclusions.append(f'API berhasil melayani semua request ({success_rate}% success rate) namun response time melebihi standar.')
-              conclusions.append(f'P95 response time mencapai {p95:.0f}ms — artinya 1 dari 20 request membutuhkan lebih dari {p95:.0f}ms.')
-              conclusions.append(f'Rata-rata response time {avg:.0f}ms dengan {vu} concurrent users.')
-              recommends.append('Investigasi query database — kemungkinan ada N+1 query atau missing index yang memperlambat response.')
-              recommends.append('Pertimbangkan implementasi caching (Redis/Memcached) untuk endpoint yang sering diakses.')
-              recommends.append('Review apakah ada external service call (third-party API) yang menjadi bottleneck.')
-              recommends.append('Monitor resource utilization (CPU, memory, connection pool) di server saat test berlangsung.')
+              conclusions.append(f'API berhasil melayani semua request dengan success rate <b>{success_rate}%</b>, namun response time melebihi standar.')
+              conclusions.append(f'P95 response time mencapai <b>{p95:.0f}ms</b> — artinya 1 dari 20 request membutuhkan lebih dari {p95:.0f}ms untuk selesai.')
+              conclusions.append(f'Rata-rata response time <b>{avg:.0f}ms</b> dengan <b>{vu} concurrent users</b> mengindikasikan adanya bottleneck di sisi server atau database.')
+              conclusions.append(f'Dengan limit CPU <b>2000m (2 core)</b> dan memory <b>2048Mi</b> per pod, kemungkinan resource mulai terkuras pada beban ini.')
+              recommends.append('Investigasi query database — kemungkinan ada N+1 query atau missing index yang memperlambat response di Spring Boot service.')
+              recommends.append('Review apakah HPA sudah melakukan scale-up ke replica tambahan. Dengan maxReplicas: 5, seharusnya ada headroom untuk menangani beban lebih.')
+              recommends.append('Pertimbangkan implementasi caching (Redis) untuk mengurangi DB calls pada endpoint burn-inquiry.')
+              recommends.append('Monitor JVM heap usage — Spring Boot di Java 17 dengan heap yang mendekati batas 2048Mi dapat menyebabkan GC pause yang signifikan.')
+              recommends.append('Cek thread pool size di Spring Boot (server.tomcat.threads.max) — default 200 thread mungkin perlu disesuaikan.')
 
           else:  # FAIL
-              if error_pct > 0:
-                  conclusions.append(f'API mengalami kegagalan signifikan dengan error rate {error_pct}% dari total {total_req:,} request.')
-              if timeout_pct > 0:
-                  conclusions.append(f'Timeout rate mencapai {timeout_pct}% — server tidak merespons dalam batas waktu 10 detik.')
-              if d.get('error_5xx_count', 0):
-                  conclusions.append(f'Terdapat {d["error_5xx_count"]} server error (5xx) yang mengindikasikan masalah di sisi server.')
-              if d.get('error_4xx_count', 0):
-                  conclusions.append(f'Terdapat {d["error_4xx_count"]} client error (4xx) — kemungkinan masalah autentikasi atau payload.')
-              if not conclusions:
-                  conclusions.append(d.get('fail_reasons', 'Test gagal memenuhi threshold yang ditentukan.'))
-              recommends.append('Periksa application log di server untuk stack trace error yang terjadi selama test.')
-              recommends.append('Pastikan connection pool database mencukupi untuk jumlah concurrent users yang diuji.')
-              recommends.append('Cek apakah ada memory leak atau resource exhaustion yang menyebabkan server tidak responsif.')
-              recommends.append('Turunkan jumlah VU dan uji ulang untuk menemukan batas kapasitas yang aman.')
+              if timeout_cnt > 0:
+                  conclusions.append(f'<b>{timeout_cnt} dari {total_req} request ({timeout_rate_pct}%) mengalami timeout</b> — server tidak merespons dalam batas waktu 10 detik.')
+              if err5xx > 0:
+                  conclusions.append(f'Terdapat <b>{err5xx} server error (5xx)</b> yang mengindikasikan crash atau unhandled exception di aplikasi.')
+              if err4xx > 0:
+                  conclusions.append(f'Terdapat <b>{err4xx} client error (4xx)</b> — kemungkinan masalah autentikasi atau payload.')
+              if p95 >= 2000:
+                  conclusions.append(f'P95 response time mencapai <b>{p95:.0f}ms</b> — jauh melewati threshold 2000ms, mengindikasikan server kelelahan di bawah beban <b>{vu} VU</b>.')
+              conclusions.append(f'Dengan spesifikasi <b>CPU 2000m dan memory 2048Mi per pod</b> (min 2 replicas), server kemungkinan sudah mencapai batas kapasitas pada <b>{vu} concurrent users</b>.')
+              recommends.append('Periksa application log Spring Boot untuk stack trace error — kemungkinan <b>ThreadPoolTaskExecutor exhausted</b> atau <b>DataSource connection pool timeout</b>.')
+              recommends.append('Cek apakah HPA sudah scale-up ke maxReplicas: 5 selama test berlangsung. Jika belum, review HPA metrics dan targetCPUUtilizationPercentage.')
+              recommends.append('Monitor JVM metrics (heap, GC pause, thread count) menggunakan Actuator + Prometheus saat test berlangsung.')
+              recommends.append(f'Turunkan VU ke 20–30 dan uji ulang untuk menemukan batas aman sebelum server mulai timeout.')
+              recommends.append('Pertimbangkan tuning <b>HikariCP connection pool</b> di Spring Boot — default maximumPoolSize=10 bisa jadi bottleneck di {vu} VU.')
+              recommends.append('Jika timeout terjadi sebelum scale-up sempat berjalan, pertimbangkan menaikkan minReplicas dari 2 ke 3 untuk baseline capacity yang lebih tinggi.')
 
-          conclusions_html = ''.join(f'<li style="margin-bottom:6px;">{c}</li>' for c in conclusions)
-          recommends_html  = ''.join(f'<li style="margin-bottom:6px;">{r}</li>' for r in recommends)
+          conclusions_html = ''.join(f'<li style="margin-bottom:8px;">{c}</li>' for c in conclusions)
+          recommends_html  = ''.join(f'<li style="margin-bottom:8px;">{r}</li>' for r in recommends)
 
-          # Error sample section
+          # ── error sample ──────────────────────────────────────────
           error_sample_html = ''
           raw_sample = d.get('error_sample', '[]')
           try:
@@ -230,15 +259,14 @@ jobs:
           except:
               pass
 
-          # ── HTML ─────────────────────────────────────────────────
+          # ── HTML ──────────────────────────────────────────────────
           html = f'''<!DOCTYPE html>
           <html lang="id">
           <head>
             <meta charset="UTF-8"/>
             <style>
-              @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
               * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-              body {{ font-family: Inter, sans-serif; color: #111827; background: white; font-size: 12px; line-height: 1.6; }}
+              body {{ font-family: Arial, sans-serif; color: #111827; background: white; font-size: 12px; line-height: 1.6; }}
               .page {{ padding: 40px 48px; max-width: 900px; margin: 0 auto; }}
               .metric-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 6px; }}
               .metric-grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
@@ -264,22 +292,59 @@ jobs:
             </div>
 
             <!-- STATUS BANNER -->
-            <div style="background:{status_bg(status)};border:1.5px solid {status_color(status)}30;border-radius:10px;padding:18px 24px;margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;">
+            <div style="background:{status_bg(status)};border:1.5px solid {status_color(status)}30;border-radius:10px;padding:18px 24px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;">
               <div>
                 <div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Overall Status</div>
                 {status_badge(status)}
               </div>
-              <div style="text-align:right;font-size:12px;color:#374151;">
-                <div style="margin-bottom:2px;"><b>Fail Reasons:</b></div>
-                <div style="color:{status_color(status)};">{d.get("fail_reasons", "-")}</div>
+              <div style="text-align:right;font-size:12px;color:#374151;max-width:60%;">
+                <div style="margin-bottom:4px;font-weight:600;">Fail Reasons:</div>
+                <div style="color:{status_color(status)};font-size:11px;">{d.get("fail_reasons", "-")}</div>
               </div>
             </div>
 
-            <!-- SECTION: EXECUTIVE SUMMARY -->
+            <!-- SERVER SPEC -->
+            {section_title("Server Specification")}
+            <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:16px 20px;margin-bottom:6px;">
+              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;">
+                <div>
+                  <div style="font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:600;">Environment</div>
+                  <div style="font-size:13px;font-weight:700;color:#0c4a6e;">DEV</div>
+                </div>
+                <div>
+                  <div style="font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:600;">Runtime</div>
+                  <div style="font-size:13px;font-weight:700;color:#0c4a6e;">Java 17 · Spring Boot 2.7</div>
+                </div>
+                <div>
+                  <div style="font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:600;">Replicas</div>
+                  <div style="font-size:13px;font-weight:700;color:#0c4a6e;">min 2 · max 5</div>
+                </div>
+              </div>
+              <div style="border-top:1px solid #bae6fd;margin-top:14px;padding-top:14px;display:grid;grid-template-columns:repeat(4,1fr);gap:16px;">
+                <div>
+                  <div style="font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-weight:600;">CPU Request</div>
+                  <div style="font-size:13px;font-weight:700;color:#0c4a6e;">2000m</div>
+                </div>
+                <div>
+                  <div style="font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-weight:600;">CPU Limit</div>
+                  <div style="font-size:13px;font-weight:700;color:#0c4a6e;">2000m</div>
+                </div>
+                <div>
+                  <div style="font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-weight:600;">Memory Request</div>
+                  <div style="font-size:13px;font-weight:700;color:#0c4a6e;">2048Mi</div>
+                </div>
+                <div>
+                  <div style="font-size:10px;color:#0369a1;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-weight:600;">Memory Limit</div>
+                  <div style="font-size:13px;font-weight:700;color:#0c4a6e;">2048Mi</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- EXECUTIVE SUMMARY -->
             {section_title("Executive Summary")}
             <div class="metric-grid">
               {metric_card("Total Request", f"{total_req:,}")}
-              {metric_card("Success Rate", f"{success_rate}", "%")}
+              {metric_card("Success Rate", f"{success_rate}", "%", f"{actual_success:,} sukses · {actual_failed:,} gagal")}
               {metric_card("Req / Second", rps)}
               {metric_card("Concurrent Users", vu, "VU")}
             </div>
@@ -287,13 +352,13 @@ jobs:
             <!-- PAGE BREAK -->
             <div style="page-break-before:always;"></div>
 
-            <!-- SECTION: RESPONSE TIME -->
+            <!-- RESPONSE TIME -->
             {section_title("Response Time")}
             <div class="metric-grid">
               {metric_card("Average", f"{avg:.0f}", "ms", "Rata-rata semua request")}
               {metric_card("P95", f"{p95:.0f}", "ms", "95% request di bawah nilai ini")}
-              {metric_card("P99", f'{float(d.get("p99_response_ms",0)):.0f}', "ms", "99% request di bawah nilai ini")}
-              {metric_card("Max", f'{float(d.get("max_response_ms",0)):.0f}', "ms", "Request terlama")}
+              {metric_card("P99", f"{p99:.0f}", "ms", "99% request di bawah nilai ini")}
+              {metric_card("Max", f"{max_ms:.0f}", "ms", "Request terlama")}
             </div>
             <div style="margin-top:12px;">
             <table style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
@@ -305,28 +370,34 @@ jobs:
               </tr></thead>
               <tbody>
                 <tr style="border-bottom:1px solid #f3f4f6;">
+                  <td style="padding:9px 14px;font-size:12px;">Min Response Time</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{min_ms:.0f} ms</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">-</td>
+                  <td style="padding:9px 14px;text-align:right;color:#6b7280;">-</td>
+                </tr>
+                <tr style="border-bottom:1px solid #f3f4f6;">
+                  <td style="padding:9px 14px;font-size:12px;">Average Response Time</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{avg:.0f} ms</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">-</td>
+                  <td style="padding:9px 14px;text-align:right;color:#6b7280;">-</td>
+                </tr>
+                <tr style="border-bottom:1px solid #f3f4f6;">
                   <td style="padding:9px 14px;font-size:12px;">P95 Response Time</td>
                   <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{p95:.0f} ms</td>
                   <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 2000 ms</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>' if p95 < 2000 else '<span style="color:#b45309;font-weight:600;">⚠ SLOW</span>'}</td>
-                </tr>
-                <tr style="border-bottom:1px solid #f3f4f6;">
-                  <td style="padding:9px 14px;font-size:12px;">P99 Response Time</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{float(d.get("p99_response_ms",0)):.0f} ms</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 5000 ms</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>' if float(d.get("p99_response_ms",0)) < 5000 else '<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>'}</td>
+                  <td style="padding:9px 14px;text-align:right;">{slow_or_fail(p95, 2000)}</td>
                 </tr>
                 <tr>
-                  <td style="padding:9px 14px;font-size:12px;">Min Response Time</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{float(d.get("min_response_ms",0)):.0f} ms</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">-</td>
-                  <td style="padding:9px 14px;text-align:right;color:#6b7280;">-</td>
+                  <td style="padding:9px 14px;font-size:12px;">P99 Response Time</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{p99:.0f} ms</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 5000 ms</td>
+                  <td style="padding:9px 14px;text-align:right;">{threshold_status(p99, 5000)}</td>
                 </tr>
               </tbody>
             </table>
             </div>
 
-            <!-- SECTION: ERROR BREAKDOWN -->
+            <!-- ERROR BREAKDOWN -->
             {section_title("Error Breakdown")}
             <table style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
               <thead><tr style="background:#f3f4f6;">
@@ -337,27 +408,26 @@ jobs:
                 <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Status</th>
               </tr></thead>
               <tbody>
-                {table_row("Timeout (0)", f'{d.get("timeout_count",0)} req', float(d.get("timeout_rate_pct",0)) > 2)}
                 <tr style="border-bottom:1px solid #f3f4f6;">
-                  <td style="padding:9px 14px;font-size:12px;">Timeout (0)</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{d.get("timeout_count",0)}</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{d.get("timeout_rate_pct","0")}%</td>
+                  <td style="padding:9px 14px;font-size:12px;">Timeout (no response)</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{timeout_cnt}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{timeout_rate_pct}%</td>
                   <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 2%</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>' if float(d.get("timeout_rate_pct",0)) >= 2 else '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'}</td>
+                  <td style="padding:9px 14px;text-align:right;">{threshold_status(timeout_rate_pct, 2)}</td>
                 </tr>
                 <tr style="border-bottom:1px solid #f3f4f6;">
                   <td style="padding:9px 14px;font-size:12px;">4xx Client Error</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{d.get("error_4xx_count",0)}</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{d.get("error_rate_pct","0")}%</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{err4xx}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{err4xx_rate_pct}%</td>
                   <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 5%</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>' if float(d.get("error_rate_pct",0)) >= 5 else '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'}</td>
+                  <td style="padding:9px 14px;text-align:right;">{threshold_status(err4xx_rate_pct, 5)}</td>
                 </tr>
                 <tr>
                   <td style="padding:9px 14px;font-size:12px;">5xx Server Error</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{d.get("error_5xx_count",0)}</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{d.get("error_rate_pct","0")}%</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{err5xx}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{err5xx_rate_pct}%</td>
                   <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 2%</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>' if int(d.get("error_5xx_count",0)) > 0 else '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'}</td>
+                  <td style="padding:9px 14px;text-align:right;">{threshold_status(err5xx_rate_pct, 2)}</td>
                 </tr>
               </tbody>
             </table>
@@ -367,7 +437,7 @@ jobs:
             <!-- PAGE BREAK -->
             <div style="page-break-before:always;"></div>
 
-            <!-- SECTION: KESIMPULAN -->
+            <!-- KESIMPULAN -->
             {section_title("Kesimpulan")}
             <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:20px;">
               <ul style="color:#374151;font-size:12px;">
@@ -375,7 +445,7 @@ jobs:
               </ul>
             </div>
 
-            <!-- SECTION: REKOMENDASI -->
+            <!-- REKOMENDASI -->
             {section_title("Rekomendasi")}
             <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px 20px;margin-bottom:28px;">
               <ul style="color:#1e40af;font-size:12px;">

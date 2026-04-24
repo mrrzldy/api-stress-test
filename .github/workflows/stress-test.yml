@@ -163,7 +163,11 @@ jobs:
           p95          = float(d.get('p95_response_ms', 0))
           p99_raw      = float(d.get('p99_response_ms', 0))
           p99          = p99_raw if p99_raw > 0 else 0
-          p99_display  = f'{p99_raw:.0f}' if p99_raw > 0 else 'N/A'
+          # P99 fallback: jika k6 tidak menghasilkan P99 (data points kurang),
+          # gunakan estimasi P95 * 1.15 sebagai pendekatan konservatif
+          p99_estimated = p99_raw == 0 and p95 > 0
+          p99_display   = f'{p99_raw:.0f}' if p99_raw > 0 else (f'~{p95 * 1.15:.0f} (est.)' if p95 > 0 else 'N/A')
+          p99_val       = p99_raw if p99_raw > 0 else p95 * 1.15
           avg          = float(d.get('avg_response_ms', 0))
           min_ms       = float(d.get('min_response_ms', 0))
           max_ms       = float(d.get('max_response_ms', 0))
@@ -189,48 +193,53 @@ jobs:
           err4xx_rate_pct  = round((err4xx / total_req * 100), 2) if total_req > 0 else 0
           err5xx_rate_pct  = round((err5xx / total_req * 100), 2) if total_req > 0 else 0
 
-          # ── resource estimation ───────────────────────────────────
-          # Concurrency utilization: Little's Law — L = λ × W
-          # L  = avg concurrent requests in system
-          # λ  = arrival rate (req/s)
-          # W  = avg response time (seconds)
+          # ── throughput ────────────────────────────────────────────
           rps_float        = float(rps)
-          avg_sec          = avg / 1000.0
-          little_l         = round(rps_float * avg_sec, 1)
+          success_rps      = round(actual_success / max(total_req, 1) * rps_float, 2)
+          fail_rps         = round(actual_failed / max(total_req, 1) * rps_float, 2)
+          timeout_rps      = round(timeout_cnt / max(total_req, 1) * rps_float, 2)
 
-          # Thread pool utilization estimate
-          # Spring Boot Tomcat default max threads = 200
-          # Each request holds a thread for avg_sec duration
+          # ── resource estimation ───────────────────────────────────
+          # FIX: gunakan avg yang memperhitungkan timeout sebagai 10000ms
+          # agar Little's Law mencerminkan actual load di server
+          avg_incl_timeout = (
+              (avg * actual_success + 10000 * timeout_cnt) / total_req
+              if total_req > 0 else avg
+          )
+          avg_incl_sec     = avg_incl_timeout / 1000.0
+
+          # Little's Law: L = λ × W
+          little_l         = round(rps_float * avg_incl_sec, 1)
+
+          # Thread pool: Tomcat default 200 threads per pod
           tomcat_max        = 200
           thread_util_pct   = round((little_l / tomcat_max * 100), 1)
 
-          # HikariCP connection estimate
-          # Default maximumPoolSize = 10 per pod, min 2 pods = 20 total
-          hikari_pool_total = 10 * 2  # per pod × min replicas
-          # DB connections needed ≈ concurrent non-timeout requests
-          non_timeout_rps   = rps_float * (1 - timeout_cnt / total_req) if total_req > 0 else rps_float
-          db_conn_needed    = round(non_timeout_rps * avg_sec, 1)
+          # HikariCP: default 10 conn per pod × 2 pods = 20 total
+          # DB conn only consumed by non-timeout requests
+          hikari_pool_total = 10 * 2
+          avg_success_sec   = avg / 1000.0
+          db_conn_needed    = round(success_rps * avg_success_sec, 1)
           hikari_util_pct   = round((db_conn_needed / hikari_pool_total * 100), 1)
 
-          # CPU estimation: 2000m per pod × 2 pods = 4000m total
-          # Rough heuristic: each active request ≈ 5-20% of 1 core
-          # We use Little's law result as proxy for load
+          # CPU: 2000m × 2 pods = 4000m total
+          # IO-bound (avg > 3s): heuristic 8m CPU per concurrent req
+          # CPU-bound (avg <= 3s): heuristic 20m CPU per concurrent req
           cpu_total_m       = 2000 * 2
-          # If avg > 5s, likely IO-bound; use conservative 5m CPU per req
-          cpu_per_req_m     = 5 if avg > 5000 else 15
+          cpu_per_req_m     = 8 if avg > 3000 else 20
           cpu_used_m        = round(little_l * cpu_per_req_m, 0)
           cpu_util_pct      = round((cpu_used_m / cpu_total_m * 100), 1)
 
-          # Bottleneck detection
+          # Bottleneck detection (priority order)
           bottleneck = 'Tidak terdeteksi'
           if hikari_util_pct >= 80:
-              bottleneck = 'HikariCP Connection Pool (database connections exhausted)'
+              bottleneck = 'HikariCP Connection Pool — database connections exhausted'
           elif thread_util_pct >= 80:
-              bottleneck = 'Tomcat Thread Pool (request threads exhausted)'
+              bottleneck = 'Tomcat Thread Pool — request threads exhausted'
           elif cpu_util_pct >= 80:
-              bottleneck = 'CPU Resource (compute-bound)'
+              bottleneck = 'CPU Resource — compute-bound'
           elif timeout_rate_pct >= 20:
-              bottleneck = 'External/DB Response Time (downstream latency)'
+              bottleneck = 'Downstream Latency — DB/external service lambat, bukan resource server'
 
           # ── kesimpulan & rekomendasi ──────────────────────────────
           conclusions = []
@@ -275,8 +284,18 @@ jobs:
               recommends.append(f'Pertimbangkan tuning <b>HikariCP connection pool</b> di Spring Boot — default maximumPoolSize=10 bisa jadi bottleneck di {vu} VU.')
               recommends.append('Jika timeout terjadi sebelum scale-up sempat berjalan, pertimbangkan menaikkan minReplicas dari 2 ke 3 untuk baseline capacity yang lebih tinggi.')
 
-          conclusions_html = ''.join(f'<li>{c}</li>' for c in conclusions)
-          recommends_html  = ''.join(f'<li>{r}</li>' for r in recommends)
+          conclusions_html = ''.join(
+              f'<div style="display:table;width:100%;margin-bottom:8px;">'
+              f'<span style="display:table-cell;width:14px;vertical-align:top;color:#374151;">•</span>'
+              f'<span style="display:table-cell;color:#374151;font-size:12px;">{c}</span></div>'
+              for c in conclusions
+          )
+          recommends_html = ''.join(
+              f'<div style="display:table;width:100%;margin-bottom:8px;">'
+              f'<span style="display:table-cell;width:14px;vertical-align:top;color:#1e40af;">•</span>'
+              f'<span style="display:table-cell;color:#1e40af;font-size:12px;">{r}</span></div>'
+              for r in recommends
+          )
 
           # ── error sample ──────────────────────────────────────────
           error_sample_html = ''
@@ -481,8 +500,48 @@ jobs:
             <!-- PAGE BREAK -->
             <div style="page-break-before:always;"></div>
 
-            <!-- PAGE BREAK -->
-            <div style="page-break-before:always;"></div>
+            <!-- THROUGHPUT -->
+            {section_title("Throughput")}
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px;">
+              {metric_card("Total Req/s", f"{rps_float:.2f}", "", "Semua request (berhasil + gagal)")}
+              {metric_card("Success Req/s", f"{success_rps:.2f}", "", f"{actual_success:,} sukses selama test")}
+              {metric_card("Failed Req/s", f"{fail_rps:.2f}", "", f"{actual_failed:,} gagal selama test")}
+              {metric_card("Timeout Req/s", f"{timeout_rps:.2f}", "", f"{timeout_cnt:,} timeout selama test")}
+            </div>
+            <table style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:6px;">
+              <thead><tr style="background:#f3f4f6;">
+                <th style="padding:9px 14px;text-align:left;font-size:11px;color:#374151;">Kategori</th>
+                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Jumlah</th>
+                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Rate (req/s)</th>
+                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Persentase</th>
+              </tr></thead>
+              <tbody>
+                <tr style="border-bottom:1px solid #f3f4f6;">
+                  <td style="padding:9px 14px;font-size:12px;">✓ Success (HTTP 200)</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{actual_success:,}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{success_rps:.2f}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#1a7a4a;font-weight:600;">{success_rate}%</td>
+                </tr>
+                <tr style="border-bottom:1px solid #f3f4f6;">
+                  <td style="padding:9px 14px;font-size:12px;">✗ Timeout (no response)</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{timeout_cnt:,}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{timeout_rps:.2f}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#b91c1c;font-weight:600;">{timeout_rate_pct}%</td>
+                </tr>
+                <tr style="border-bottom:1px solid #f3f4f6;">
+                  <td style="padding:9px 14px;font-size:12px;">✗ 4xx Client Error</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{err4xx:,}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{round(err4xx / max(total_req,1) * rps_float, 2):.2f}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;{'color:#b91c1c;font-weight:600;' if err4xx > 0 else 'color:#6b7280;'}">{err4xx_rate_pct}%</td>
+                </tr>
+                <tr>
+                  <td style="padding:9px 14px;font-size:12px;">✗ 5xx Server Error</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{err5xx:,}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{round(err5xx / max(total_req,1) * rps_float, 2):.2f}</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;{'color:#b91c1c;font-weight:600;' if err5xx > 0 else 'color:#6b7280;'}">{err5xx_rate_pct}%</td>
+                </tr>
+              </tbody>
+            </table>
 
             <!-- RESOURCE ESTIMATION -->
             {section_title("Resource Estimation")}
@@ -535,17 +594,13 @@ jobs:
             <!-- KESIMPULAN -->
             {section_title("Kesimpulan")}
             <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:20px;">
-              <ul style="color:#374151;font-size:12px;">
-                {conclusions_html}
-              </ul>
+              {conclusions_html}
             </div>
 
             <!-- REKOMENDASI -->
             {section_title("Rekomendasi")}
             <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px 20px;margin-bottom:28px;">
-              <ul style="color:#1e40af;font-size:12px;">
-                {recommends_html}
-              </ul>
+              {recommends_html}
             </div>
 
             <!-- FOOTER -->

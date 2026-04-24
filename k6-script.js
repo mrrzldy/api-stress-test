@@ -9,7 +9,7 @@ const errorRate      = new Rate('error_rate');
 const timeoutRate    = new Rate('timeout_rate');
 const error4xxRate   = new Rate('error_4xx_rate');
 const error5xxRate   = new Rate('error_5xx_rate');
-const responseTime   = new Trend('response_time');
+const responseTime   = new Trend('response_time', true); // true = enable percentiles
 const successCount   = new Counter('success_count');
 const failCount      = new Counter('fail_count');
 const timeoutCount   = new Counter('timeout_count');
@@ -19,10 +19,10 @@ const error5xxCount  = new Counter('error_5xx_count');
 // ============================================================
 // CONFIG
 // ============================================================
-const BASE_URL      = __ENV.TARGET_URL   || 'https://your-dev-api.com';
-const BEARER_TOKEN  = __ENV.BEARER_TOKEN || '';
+const BASE_URL      = __ENV.TARGET_URL    || 'https://your-dev-api.com';
+const BEARER_TOKEN  = __ENV.BEARER_TOKEN  || '';
 const VIRTUAL_USERS = parseInt(__ENV.VIRTUAL_USERS) || 100;
-const DURATION      = __ENV.DURATION     || '1m';
+const DURATION      = __ENV.DURATION      || '1m';
 const RAMP_DURATION = __ENV.RAMP_DURATION || '30s';
 
 // ============================================================
@@ -36,8 +36,6 @@ export const options = {
     { duration: RAMP_DURATION, target: 0 },
   ],
   thresholds: {
-    // Threshold ini hanya untuk error — bukan performance
-    // Performance lambat akan dicatat sebagai SLOW, bukan FAIL
     error_rate:      ['rate<0.05'],
     timeout_rate:    ['rate<0.02'],
     error_4xx_rate:  ['rate<0.05'],
@@ -96,7 +94,13 @@ export default function () {
   error4xxRate.add(is4xx);
   error5xxRate.add(is5xx);
   errorRate.add(!isSuccess);
-  responseTime.add(res.timings.duration);
+
+  // FIX: only add response time for non-timeout requests
+  // Timeout responses have duration = 10000ms (the timeout ceiling),
+  // which skews P95/P99 — exclude them for accurate percentiles
+  if (!isTimeout) {
+    responseTime.add(res.timings.duration);
+  }
 
   // Collect error sample max 5
   if (!isSuccess && errorSamples.length < 5) {
@@ -135,18 +139,20 @@ export function handleSummary(data) {
   const err4xx       = data.metrics.error_4xx_count?.values?.count || 0;
   const err5xx       = data.metrics.error_5xx_count?.values?.count || 0;
   const errorRatePct = ((data.metrics.http_req_failed?.values?.rate || 0) * 100).toFixed(2);
-  const p95          = data.metrics.http_req_duration?.values['p(95)'] || 0;
-  const p99          = data.metrics.http_req_duration?.values['p(99)'] || 0;
+
+  // FIX: use custom response_time metric (excludes timeouts) for accurate P95/P99
+  // Falls back to http_req_duration if custom metric is unavailable
+  const rtMetric = data.metrics.response_time || data.metrics.http_req_duration;
+  const p95      = rtMetric?.values['p(95)'] || 0;
+  const p99      = rtMetric?.values['p(99)'] || 0;
+  const avgMs    = rtMetric?.values?.avg || 0;
+  const minMs    = rtMetric?.values?.min || 0;
+  const maxMs    = rtMetric?.values?.max || 0;
 
   // ── Status logic ──────────────────────────────────────────
-  // FAIL  = ada error (4xx/5xx/timeout melebihi threshold)
-  // SLOW  = semua request sukses tapi response time lambat
-  // PASS  = semua aman
-  // ─────────────────────────────────────────────────────────
   let overallStatus = 'PASS';
   const failReasons = [];
 
-  // Cek error-based (ini yang beneran masalah → FAIL)
   if (data.metrics.http_req_failed?.values?.rate >= 0.05) {
     overallStatus = 'FAIL';
     failReasons.push(`Error rate ${errorRatePct}% (threshold <5%)`);
@@ -164,7 +170,6 @@ export function handleSummary(data) {
     failReasons.push(`4xx error rate ${(data.metrics.error_4xx_rate?.values?.rate * 100).toFixed(2)}% (threshold <5%)`);
   }
 
-  // Cek performance (lambat → SLOW, bukan FAIL)
   if (p95 >= 2000) {
     if (overallStatus === 'PASS') overallStatus = 'SLOW';
     failReasons.push(`P95 response time ${p95.toFixed(0)}ms (threshold <2000ms)`);
@@ -174,7 +179,6 @@ export function handleSummary(data) {
     failReasons.push(`P99 response time ${p99.toFixed(0)}ms (threshold <5000ms)`);
   }
 
-  // HTTP status breakdown
   const httpStatusBreakdown = {};
   if (timeouts > 0) httpStatusBreakdown['timeout(0)'] = timeouts;
   if (err4xx > 0)   httpStatusBreakdown['4xx'] = err4xx;
@@ -185,6 +189,7 @@ export function handleSummary(data) {
     target_url:       BASE_URL,
     virtual_users:    VIRTUAL_USERS,
     duration:         DURATION,
+    ramp_duration:    RAMP_DURATION,   // FIX: added missing field
     status:           overallStatus,
     fail_reasons:     failReasons.join(' | ') || '-',
 
@@ -199,11 +204,12 @@ export function handleSummary(data) {
     error_rate_pct:   errorRatePct,
     timeout_rate_pct: ((data.metrics.timeout_rate?.values?.rate || 0) * 100).toFixed(2),
 
-    avg_response_ms:  (data.metrics.http_req_duration?.values?.avg || 0).toFixed(2),
+    // FIX: use custom response_time metric for accurate values (excludes timeouts)
+    avg_response_ms:  avgMs.toFixed(2),
     p95_response_ms:  p95.toFixed(2),
     p99_response_ms:  p99.toFixed(2),
-    min_response_ms:  (data.metrics.http_req_duration?.values?.min || 0).toFixed(2),
-    max_response_ms:  (data.metrics.http_req_duration?.values?.max || 0).toFixed(2),
+    min_response_ms:  minMs.toFixed(2),
+    max_response_ms:  maxMs.toFixed(2),
 
     http_status:      JSON.stringify(httpStatusBreakdown),
     error_sample:     JSON.stringify(errorSamples),
@@ -218,6 +224,7 @@ export function handleSummary(data) {
 Target URL   : ${BASE_URL}
 Virtual Users: ${VIRTUAL_USERS}
 Duration     : ${DURATION}
+Ramp Duration: ${RAMP_DURATION}
 Status       : ${overallStatus}
 ${failReasons.length > 0 ? 'Reasons      : ' + failReasons.join('\n               ') : ''}
 -------------------------------------
@@ -234,7 +241,7 @@ ERROR BREAKDOWN
   Error Rate     : ${errorRatePct}%
   Timeout Rate   : ${summary.timeout_rate_pct}%
 -------------------------------------
-RESPONSE TIME
+RESPONSE TIME (excluding timeouts)
   Avg            : ${summary.avg_response_ms} ms
   P95            : ${summary.p95_response_ms} ms
   P99            : ${summary.p99_response_ms} ms

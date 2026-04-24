@@ -17,9 +17,9 @@ const error4xxCount  = new Counter('error_4xx_count');
 const error5xxCount  = new Counter('error_5xx_count');
 
 // ============================================================
-// CONFIG — dari GitHub Actions
+// CONFIG
 // ============================================================
-const BASE_URL      = __ENV.TARGET_URL  || 'https://your-dev-api.com';
+const BASE_URL      = __ENV.TARGET_URL   || 'https://your-dev-api.com';
 const BEARER_TOKEN  = __ENV.BEARER_TOKEN || '';
 const VIRTUAL_USERS = parseInt(__ENV.VIRTUAL_USERS) || 100;
 const DURATION      = __ENV.DURATION     || '1m';
@@ -36,25 +36,18 @@ export const options = {
     { duration: RAMP_DURATION, target: 0 },
   ],
   thresholds: {
-    http_req_duration:  ['p(95)<2000', 'p(99)<5000'],
-    error_rate:         ['rate<0.05'],
-    timeout_rate:       ['rate<0.02'],   // timeout < 2%
-    error_4xx_rate:     ['rate<0.05'],   // 4xx < 5%
-    error_5xx_rate:     ['rate<0.02'],   // 5xx < 2%
-    http_req_failed:    ['rate<0.05'],
+    http_req_duration: ['p(95)<2000', 'p(99)<5000'],
+    error_rate:        ['rate<0.05'],
+    timeout_rate:      ['rate<0.02'],
+    error_4xx_rate:    ['rate<0.05'],
+    error_5xx_rate:    ['rate<0.02'],
+    http_req_failed:   ['rate<0.05'],
   },
-  // Timeout per request 10 detik
-  httpDebug: 'full',
 };
 
 // ============================================================
-// REQUEST
+// PAYLOAD
 // ============================================================
-const headers = {
-  'Content-Type': 'application/json',
-  'Authorization': `Bearer ${BEARER_TOKEN}`,
-};
-
 const payload = JSON.stringify({
   loyaltyMemberId: 'KAI00000605',
   productCode:     '123PROM',
@@ -71,24 +64,29 @@ const payload = JSON.stringify({
 });
 
 // ============================================================
+// ERROR SAMPLE COLLECTOR
+// ============================================================
+// Simpan sample error (max 5) untuk dikirim ke summary
+const errorSamples = [];
+
+// ============================================================
 // MAIN TEST FUNCTION
 // ============================================================
 export default function () {
-const res = http.post(`${BASE_URL}`, payload, {
-  headers: {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${BEARER_TOKEN}`,
-  },
-  timeout: '10s',
-});
+  // FIX #1: headers didefinisikan HANYA di sini, tidak ada duplikat di luar
+  const res = http.post(`${BASE_URL}`, payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${BEARER_TOKEN}`,
+    },
+    timeout: '10s',
+  });
 
-  // Deteksi timeout (status 0 = network error / timeout)
   const isTimeout = res.status === 0;
   const is4xx     = res.status >= 400 && res.status < 500;
   const is5xx     = res.status >= 500;
   const isSuccess = res.status === 200;
 
-  // Track per kategori
   timeoutCount.add(isTimeout ? 1 : 0);
   error4xxCount.add(is4xx ? 1 : 0);
   error5xxCount.add(is5xx ? 1 : 0);
@@ -101,16 +99,22 @@ const res = http.post(`${BASE_URL}`, payload, {
   errorRate.add(!isSuccess);
   responseTime.add(res.timings.duration);
 
-  // Check & validasi
+  // FIX #2: Collect error sample (max 5 biar ga bloat)
+  if (!isSuccess && errorSamples.length < 5) {
+    errorSamples.push({
+      status: res.status,
+      body:   res.body ? res.body.substring(0, 300) : '(empty)',
+    });
+  }
+
   check(res, {
-    'status 200':          (r) => r.status === 200,
-    'tidak timeout':       (r) => r.status !== 0,
-    'tidak 4xx':           (r) => r.status < 400 || r.status >= 500,
-    'tidak 5xx':           (r) => r.status < 500,
-    'response time < 2s':  (r) => r.timings.duration < 2000,
+    'status 200':         (r) => r.status === 200,
+    'tidak timeout':      (r) => r.status !== 0,
+    'tidak 4xx':          (r) => r.status < 400 || r.status >= 500,
+    'tidak 5xx':          (r) => r.status < 500,
+    'response time < 2s': (r) => r.timings.duration < 2000,
   });
 
-  // Log error detail ke console (keliatan di GitHub Actions log)
   if (isTimeout) {
     console.error(`[TIMEOUT] VU=${__VU} ITER=${__ITER} - Request timeout setelah 10s`);
   } else if (is4xx) {
@@ -123,7 +127,7 @@ const res = http.post(`${BASE_URL}`, payload, {
 }
 
 // ============================================================
-// SUMMARY REPORT — dikirim ke Google Sheet
+// SUMMARY REPORT
 // ============================================================
 export function handleSummary(data) {
   const totalReqs    = data.metrics.http_reqs?.values?.count || 0;
@@ -133,7 +137,6 @@ export function handleSummary(data) {
   const err5xx       = data.metrics.error_5xx_count?.values?.count || 0;
   const errorRatePct = ((data.metrics.http_req_failed?.values?.rate || 0) * 100).toFixed(2);
 
-  // Tentukan status keseluruhan
   let overallStatus = 'PASS';
   const failReasons = [];
 
@@ -154,6 +157,12 @@ export function handleSummary(data) {
     failReasons.push(`5xx error rate ${(data.metrics.error_5xx_rate?.values?.rate * 100).toFixed(2)}% (threshold <2%)`);
   }
 
+  // FIX #2: http_status breakdown + error_sample masuk ke summary
+  const httpStatusBreakdown = {};
+  if (timeouts > 0)  httpStatusBreakdown['timeout(0)'] = timeouts;
+  if (err4xx > 0)    httpStatusBreakdown['4xx'] = err4xx;
+  if (err5xx > 0)    httpStatusBreakdown['5xx'] = err5xx;
+
   const summary = {
     timestamp:        new Date().toISOString(),
     target_url:       BASE_URL,
@@ -162,39 +171,39 @@ export function handleSummary(data) {
     status:           overallStatus,
     fail_reasons:     failReasons.join(' | ') || '-',
 
-    // Volume
     total_requests:   totalReqs,
     req_per_second:   (data.metrics.http_reqs?.values?.rate || 0).toFixed(2),
     success_count:    totalReqs - failedReqs,
     fail_count:       failedReqs,
 
-    // Error breakdown
     timeout_count:    timeouts,
     error_4xx_count:  err4xx,
     error_5xx_count:  err5xx,
     error_rate_pct:   errorRatePct,
     timeout_rate_pct: ((data.metrics.timeout_rate?.values?.rate || 0) * 100).toFixed(2),
 
-    // Response time
     avg_response_ms:  (data.metrics.http_req_duration?.values?.avg || 0).toFixed(2),
     p95_response_ms:  (data.metrics.http_req_duration?.values['p(95)'] || 0).toFixed(2),
     p99_response_ms:  (data.metrics.http_req_duration?.values['p(99)'] || 0).toFixed(2),
     min_response_ms:  (data.metrics.http_req_duration?.values?.min || 0).toFixed(2),
     max_response_ms:  (data.metrics.http_req_duration?.values?.max || 0).toFixed(2),
+
+    // FIX #2: Field baru ini yang bakal keliatan di Sheet
+    http_status:      JSON.stringify(httpStatusBreakdown),
+    error_sample:     JSON.stringify(errorSamples),
   };
 
   console.log('K6_SUMMARY_JSON=' + JSON.stringify(summary));
 
-  // Text report untuk GitHub Actions log
   const textReport = `
 =====================================
        STRESS TEST REPORT
 =====================================
-Target URL  : ${BASE_URL}
+Target URL   : ${BASE_URL}
 Virtual Users: ${VIRTUAL_USERS}
-Duration    : ${DURATION}
-Status      : ${overallStatus}
-${failReasons.length > 0 ? 'Fail Reasons: ' + failReasons.join('\n              ') : ''}
+Duration     : ${DURATION}
+Status       : ${overallStatus}
+${failReasons.length > 0 ? 'Fail Reasons : ' + failReasons.join('\n               ') : ''}
 -------------------------------------
 VOLUME
   Total Requests : ${totalReqs}
@@ -215,6 +224,9 @@ RESPONSE TIME
   P99            : ${summary.p99_response_ms} ms
   Min            : ${summary.min_response_ms} ms
   Max            : ${summary.max_response_ms} ms
+-------------------------------------
+ERROR SAMPLES (max 5)
+  ${errorSamples.length === 0 ? 'Tidak ada error' : errorSamples.map((e, i) => `[${i+1}] status=${e.status} body=${e.body}`).join('\n  ')}
 =====================================
 `;
 

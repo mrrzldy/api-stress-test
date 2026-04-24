@@ -189,6 +189,49 @@ jobs:
           err4xx_rate_pct  = round((err4xx / total_req * 100), 2) if total_req > 0 else 0
           err5xx_rate_pct  = round((err5xx / total_req * 100), 2) if total_req > 0 else 0
 
+          # ── resource estimation ───────────────────────────────────
+          # Concurrency utilization: Little's Law — L = λ × W
+          # L  = avg concurrent requests in system
+          # λ  = arrival rate (req/s)
+          # W  = avg response time (seconds)
+          rps_float        = float(rps)
+          avg_sec          = avg / 1000.0
+          little_l         = round(rps_float * avg_sec, 1)
+
+          # Thread pool utilization estimate
+          # Spring Boot Tomcat default max threads = 200
+          # Each request holds a thread for avg_sec duration
+          tomcat_max        = 200
+          thread_util_pct   = round((little_l / tomcat_max * 100), 1)
+
+          # HikariCP connection estimate
+          # Default maximumPoolSize = 10 per pod, min 2 pods = 20 total
+          hikari_pool_total = 10 * 2  # per pod × min replicas
+          # DB connections needed ≈ concurrent non-timeout requests
+          non_timeout_rps   = rps_float * (1 - timeout_cnt / total_req) if total_req > 0 else rps_float
+          db_conn_needed    = round(non_timeout_rps * avg_sec, 1)
+          hikari_util_pct   = round((db_conn_needed / hikari_pool_total * 100), 1)
+
+          # CPU estimation: 2000m per pod × 2 pods = 4000m total
+          # Rough heuristic: each active request ≈ 5-20% of 1 core
+          # We use Little's law result as proxy for load
+          cpu_total_m       = 2000 * 2
+          # If avg > 5s, likely IO-bound; use conservative 5m CPU per req
+          cpu_per_req_m     = 5 if avg > 5000 else 15
+          cpu_used_m        = round(little_l * cpu_per_req_m, 0)
+          cpu_util_pct      = round((cpu_used_m / cpu_total_m * 100), 1)
+
+          # Bottleneck detection
+          bottleneck = 'Tidak terdeteksi'
+          if hikari_util_pct >= 80:
+              bottleneck = 'HikariCP Connection Pool (database connections exhausted)'
+          elif thread_util_pct >= 80:
+              bottleneck = 'Tomcat Thread Pool (request threads exhausted)'
+          elif cpu_util_pct >= 80:
+              bottleneck = 'CPU Resource (compute-bound)'
+          elif timeout_rate_pct >= 20:
+              bottleneck = 'External/DB Response Time (downstream latency)'
+
           # ── kesimpulan & rekomendasi ──────────────────────────────
           conclusions = []
           recommends  = []
@@ -232,8 +275,8 @@ jobs:
               recommends.append(f'Pertimbangkan tuning <b>HikariCP connection pool</b> di Spring Boot — default maximumPoolSize=10 bisa jadi bottleneck di {vu} VU.')
               recommends.append('Jika timeout terjadi sebelum scale-up sempat berjalan, pertimbangkan menaikkan minReplicas dari 2 ke 3 untuk baseline capacity yang lebih tinggi.')
 
-          conclusions_html = ''.join(f'<li style="margin-bottom:8px;">{c}</li>' for c in conclusions)
-          recommends_html  = ''.join(f'<li style="margin-bottom:8px;">{r}</li>' for r in recommends)
+          conclusions_html = ''.join(f'<li>{c}</li>' for c in conclusions)
+          recommends_html  = ''.join(f'<li>{r}</li>' for r in recommends)
 
           # ── error sample ──────────────────────────────────────────
           error_sample_html = ''
@@ -273,9 +316,9 @@ jobs:
               .metric-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 6px; }}
               .metric-grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
               table {{ width: 100%; border-collapse: collapse; }}
-              ul {{ padding-left: 0; list-style: none; }}
-              ul li {{ padding-left: 16px; position: relative; }}
-              ul li::before {{ content: "•"; position: absolute; left: 0; color: currentColor; }}
+              ul {{ list-style: none; padding-left: 0; margin: 0; }}
+              ul li {{ padding-left: 14px; text-indent: -14px; margin-bottom: 8px; }}
+              ul li::before {{ content: "• "; }}
               @page {{ margin: 0; size: A4; }}
             </style>
           </head>
@@ -437,6 +480,57 @@ jobs:
 
             <!-- PAGE BREAK -->
             <div style="page-break-before:always;"></div>
+
+            <!-- PAGE BREAK -->
+            <div style="page-break-before:always;"></div>
+
+            <!-- RESOURCE ESTIMATION -->
+            {section_title("Resource Estimation")}
+            <p style="font-size:11px;color:#6b7280;margin-bottom:12px;">
+              Estimasi penggunaan resource berdasarkan <b>Little's Law</b> (L = λ × W) dan spesifikasi server.
+              Nilai ini adalah perkiraan — bukan hasil monitoring aktual.
+            </p>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">
+              {metric_card("Concurrent Req", f"{little_l}", "", "Rata-rata request aktif di server (Little's Law)")}
+              {metric_card("Thread Pool", f"{thread_util_pct}", "%", f"Estimasi utilisasi Tomcat ({tomcat_max} threads)")}
+              {metric_card("DB Conn Pool", f"{hikari_util_pct}", "%", f"Estimasi utilisasi HikariCP ({hikari_pool_total} koneksi)")}
+              {metric_card("CPU Est.", f"{cpu_util_pct}", "%", f"Estimasi utilisasi CPU ({cpu_total_m}m total)")}
+            </div>
+            <table style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:12px;">
+              <thead><tr style="background:#f3f4f6;">
+                <th style="padding:9px 14px;text-align:left;font-size:11px;color:#374151;">Resource</th>
+                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Kapasitas</th>
+                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Est. Digunakan</th>
+                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Utilisasi</th>
+                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Status</th>
+              </tr></thead>
+              <tbody>
+                <tr style="border-bottom:1px solid #f3f4f6;">
+                  <td style="padding:9px 14px;font-size:12px;">Tomcat Threads (per pod)</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">{tomcat_max} threads</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{little_l} threads</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{thread_util_pct}%</td>
+                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ KRITIS</span>' if thread_util_pct >= 90 else '<span style="color:#b45309;font-weight:600;">⚠ TINGGI</span>' if thread_util_pct >= 60 else '<span style="color:#1a7a4a;font-weight:600;">✓ AMAN</span>'}</td>
+                </tr>
+                <tr style="border-bottom:1px solid #f3f4f6;">
+                  <td style="padding:9px 14px;font-size:12px;">HikariCP DB Connections (2 pods)</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">{hikari_pool_total} koneksi</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{db_conn_needed} koneksi</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{hikari_util_pct}%</td>
+                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ KRITIS</span>' if hikari_util_pct >= 90 else '<span style="color:#b45309;font-weight:600;">⚠ TINGGI</span>' if hikari_util_pct >= 60 else '<span style="color:#1a7a4a;font-weight:600;">✓ AMAN</span>'}</td>
+                </tr>
+                <tr>
+                  <td style="padding:9px 14px;font-size:12px;">CPU (2 pods × 2000m)</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">{cpu_total_m}m</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{cpu_used_m:.0f}m</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{cpu_util_pct}%</td>
+                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ KRITIS</span>' if cpu_util_pct >= 90 else '<span style="color:#b45309;font-weight:600;">⚠ TINGGI</span>' if cpu_util_pct >= 60 else '<span style="color:#1a7a4a;font-weight:600;">✓ AMAN</span>'}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div style="background:#fefce8;border:1px solid #fde047;border-radius:8px;padding:12px 16px;font-size:11px;color:#713f12;">
+              <b>⚡ Estimated Bottleneck:</b> {bottleneck}
+            </div>
 
             <!-- KESIMPULAN -->
             {section_title("Kesimpulan")}

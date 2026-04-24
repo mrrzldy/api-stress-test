@@ -4,32 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'Target API URL (dev environment)'
+        description: Target API URL (dev environment)
         required: true
-        default: 'https://your-dev-api.com/endpoint'
+        default: https://your-dev-api.com/endpoint
       virtual_users:
-        description: 'Jumlah concurrent users (VU)'
+        description: Jumlah concurrent users (VU)
         required: true
-        default: '100'
+        default: "100"
       duration:
-        description: 'Durasi stress test (contoh: 1m, 2m, 30s)'
+        description: Durasi stress test (1m, 30s, dll)
         required: true
-        default: '1m'
+        default: "1m"
       ramp_duration:
-        description: 'Durasi ramp up/down (contoh: 30s, 1m)'
+        description: Durasi ramp up/down
         required: true
-        default: '30s'
+        default: "30s"
       notify_sheet:
-        description: 'Kirim hasil ke Google Sheet? (true/false)'
+        description: Kirim ke Google Sheet (true/false)
         required: true
-        default: 'true'
+        default: "true"
 
   repository_dispatch:
     types: [run-stress-test]
 
 jobs:
   stress-test:
-    name: Run k6 Stress Test
     runs-on: ubuntu-latest
 
     steps:
@@ -38,15 +37,12 @@ jobs:
 
       - name: 🛠️ Install k6
         run: |
-          sudo gpg -k
-          sudo gpg --no-default-keyring \
-            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
-            --keyserver hkp://keyserver.ubuntu.com:80 \
-            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
-            | sudo tee /etc/apt/sources.list.d/k6.list
           sudo apt-get update
-          sudo apt-get install k6 -y
+          sudo apt-get install -y gnupg software-properties-common
+          curl -s https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install -y k6
 
       - name: 🔧 Set parameters
         run: |
@@ -68,31 +64,18 @@ jobs:
         env:
           TARGET_URL: ${{ env.TARGET_URL }}
           BEARER_TOKEN: ${{ secrets.DEV_BEARER_TOKEN }}
-          VIRTUAL_USERS: ${{ env.VIRTUAL_USERS }}
-          DURATION: ${{ env.DURATION }}
-          RAMP_DURATION: ${{ env.RAMP_DURATION }}
         run: |
           k6 run \
             --env TARGET_URL="$TARGET_URL" \
             --env BEARER_TOKEN="$BEARER_TOKEN" \
-            --env VIRTUAL_USERS="$VIRTUAL_USERS" \
-            --env DURATION="$DURATION" \
-            --env RAMP_DURATION="$RAMP_DURATION" \
+            --env VIRTUAL_USERS="${{ env.VIRTUAL_USERS }}" \
+            --env DURATION="${{ env.DURATION }}" \
+            --env RAMP_DURATION="${{ env.RAMP_DURATION }}" \
             k6-script.js 2>&1 | tee k6_output.txt || true
 
-          if [ ! -f summary.json ] || [ ! -s summary.json ]; then
-            echo "⚠️ summary.json kosong, coba extract dari log..."
-            grep 'K6_SUMMARY_JSON=' k6_output.txt \
-              | tail -1 \
-              | sed 's/.*K6_SUMMARY_JSON=//' > summary.json || true
-          fi
-
           if [ ! -s summary.json ]; then
-            echo '{"status":"FAIL","fail_reasons":"k6 did not produce summary","target_url":"'$TARGET_URL'","virtual_users":"'$VIRTUAL_USERS'","duration":"'$DURATION'","total_requests":0,"req_per_second":"0","success_count":0,"fail_count":0,"timeout_count":0,"error_4xx_count":0,"error_5xx_count":0,"error_rate_pct":"100","timeout_rate_pct":"0","avg_response_ms":"0","p95_response_ms":"0","p99_response_ms":"0","min_response_ms":"0","max_response_ms":"0","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > summary.json
+            echo '{"status":"FAIL","fail_reasons":"No summary generated"}' > summary.json
           fi
-
-          echo "=== summary.json ==="
-          cat summary.json
 
       - name: 📄 Generate PDF Report
         if: always()
@@ -101,349 +84,67 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           pip install weasyprint --quiet
+
           python3 - << 'PYEOF'
           import json, os
-          from datetime import datetime, timezone
           from weasyprint import HTML
 
-          with open('summary.json', 'r') as f:
+          with open('summary.json') as f:
               d = json.load(f)
 
-          d['run_id']  = os.environ.get('RUN_ID', '-')
-          d['run_url'] = os.environ.get('RUN_URL', '-')
-
-          # ── helpers ──────────────────────────────────────────────
-          def fmt_ts(ts):
-              try:
-                  dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                  return dt.strftime('%d %B %Y, %H:%M:%S UTC')
-              except:
-                  return ts or '-'
-
-          def status_color(s):
-              return {'PASS': '#1a7a4a', 'SLOW': '#b45309', 'FAIL': '#b91c1c'}.get(s, '#374151')
-
-          def status_bg(s):
-              return {'PASS': '#d1fae5', 'SLOW': '#fef3c7', 'FAIL': '#fee2e2'}.get(s, '#f3f4f6')
-
-          def status_badge(s):
-              icons = {'PASS': '✓', 'SLOW': '⚠', 'FAIL': '✗'}
-              icon  = icons.get(s, '?')
-              return f'<span style="background:{status_bg(s)};color:{status_color(s)};padding:6px 18px;border-radius:20px;font-weight:700;font-size:15px;">{icon} {s}</span>'
-
-          def metric_card(label, value, unit='', note=''):
-              note_html = f'<div style="font-size:10px;color:#6b7280;margin-top:2px;">{note}</div>' if note else ''
-              return f'''
-              <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:14px 18px;text-align:center;">
-                <div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">{label}</div>
-                <div style="font-size:22px;font-weight:700;color:#111827;">{value}<span style="font-size:13px;color:#6b7280;margin-left:3px;">{unit}</span></div>
-                {note_html}
-              </div>'''
-
-          def section_title(title):
-              return f'<h2 style="font-size:14px;font-weight:700;color:#111827;border-left:4px solid #2563eb;padding-left:10px;margin:28px 0 14px;">{title}</h2>'
-
-          def table_row(label, value, highlight=False):
-              bg = '#fffbeb' if highlight else 'white'
-              return f'<tr style="background:{bg};"><td style="padding:9px 14px;color:#374151;font-size:12px;border-bottom:1px solid #f3f4f6;">{label}</td><td style="padding:9px 14px;color:#111827;font-weight:600;font-size:12px;border-bottom:1px solid #f3f4f6;text-align:right;">{value}</td></tr>'
-
-          # ── interpretasi otomatis ─────────────────────────────────
-          status      = d.get('status', 'FAIL')
-          p95         = float(d.get('p95_response_ms', 0))
-          avg         = float(d.get('avg_response_ms', 0))
-          error_pct   = float(d.get('error_rate_pct', 0))
-          timeout_pct = float(d.get('timeout_rate_pct', 0))
-          total_req   = int(d.get('total_requests', 0))
-          success     = int(d.get('success_count', 0))
-          fail_count  = int(d.get('fail_count', 0))
-          vu          = d.get('virtual_users', '-')
-          duration    = d.get('duration', '-')
-          rps         = d.get('req_per_second', '0')
-
-          success_rate = round((success / total_req * 100), 2) if total_req > 0 else 0
-
-          # Kesimpulan & rekomendasi otomatis
-          conclusions  = []
-          recommends   = []
-
-          if status == 'PASS':
-              conclusions.append(f'API merespons dengan baik di bawah beban {vu} concurrent users selama {duration}.')
-              conclusions.append(f'Seluruh {total_req:,} request berhasil dengan success rate {success_rate}%.')
-              if p95 < 1000:
-                  conclusions.append(f'Response time sangat baik — 95% request selesai dalam {p95:.0f}ms.')
-              else:
-                  conclusions.append(f'Response time masih dalam batas — P95 {p95:.0f}ms di bawah threshold 2000ms.')
-              recommends.append('API siap untuk beban normal. Pertimbangkan untuk menaikkan VU secara bertahap untuk mengetahui batas kapasitas.')
-              recommends.append('Lakukan stress test rutin untuk memastikan performa tidak degradasi seiring penambahan fitur.')
-
-          elif status == 'SLOW':
-              conclusions.append(f'API berhasil melayani semua request ({success_rate}% success rate) namun response time melebihi standar.')
-              conclusions.append(f'P95 response time mencapai {p95:.0f}ms — artinya 1 dari 20 request membutuhkan lebih dari {p95:.0f}ms.')
-              conclusions.append(f'Rata-rata response time {avg:.0f}ms dengan {vu} concurrent users.')
-              recommends.append('Investigasi query database — kemungkinan ada N+1 query atau missing index yang memperlambat response.')
-              recommends.append('Pertimbangkan implementasi caching (Redis/Memcached) untuk endpoint yang sering diakses.')
-              recommends.append('Review apakah ada external service call (third-party API) yang menjadi bottleneck.')
-              recommends.append('Monitor resource utilization (CPU, memory, connection pool) di server saat test berlangsung.')
-
-          else:  # FAIL
-              if error_pct > 0:
-                  conclusions.append(f'API mengalami kegagalan signifikan dengan error rate {error_pct}% dari total {total_req:,} request.')
-              if timeout_pct > 0:
-                  conclusions.append(f'Timeout rate mencapai {timeout_pct}% — server tidak merespons dalam batas waktu 10 detik.')
-              if d.get('error_5xx_count', 0):
-                  conclusions.append(f'Terdapat {d["error_5xx_count"]} server error (5xx) yang mengindikasikan masalah di sisi server.')
-              if d.get('error_4xx_count', 0):
-                  conclusions.append(f'Terdapat {d["error_4xx_count"]} client error (4xx) — kemungkinan masalah autentikasi atau payload.')
-              if not conclusions:
-                  conclusions.append(d.get('fail_reasons', 'Test gagal memenuhi threshold yang ditentukan.'))
-              recommends.append('Periksa application log di server untuk stack trace error yang terjadi selama test.')
-              recommends.append('Pastikan connection pool database mencukupi untuk jumlah concurrent users yang diuji.')
-              recommends.append('Cek apakah ada memory leak atau resource exhaustion yang menyebabkan server tidak responsif.')
-              recommends.append('Turunkan jumlah VU dan uji ulang untuk menemukan batas kapasitas yang aman.')
-
-          conclusions_html = ''.join(f'<li style="margin-bottom:6px;">{c}</li>' for c in conclusions)
-          recommends_html  = ''.join(f'<li style="margin-bottom:6px;">{r}</li>' for r in recommends)
-
-          # Error sample section
-          error_sample_html = ''
-          raw_sample = d.get('error_sample', '[]')
-          try:
-              samples = json.loads(raw_sample) if isinstance(raw_sample, str) else raw_sample
-              if isinstance(samples, list) and len(samples) > 0:
-                  rows = ''.join(
-                      f'<tr><td style="padding:8px 12px;font-size:11px;color:#374151;border-bottom:1px solid #f3f4f6;">{i+1}</td>'
-                      f'<td style="padding:8px 12px;font-size:11px;border-bottom:1px solid #f3f4f6;"><span style="background:#fee2e2;color:#b91c1c;padding:2px 8px;border-radius:4px;font-weight:600;">{s["status"]}</span></td>'
-                      f'<td style="padding:8px 12px;font-size:11px;color:#374151;border-bottom:1px solid #f3f4f6;word-break:break-all;">{s.get("body","(empty)")}</td></tr>'
-                      for i, s in enumerate(samples)
-                  )
-                  error_sample_html = f'''
-                  {section_title("Error Samples")}
-                  <p style="font-size:11px;color:#6b7280;margin-bottom:10px;">Sample response body dari request yang gagal (maksimal 5 sample).</p>
-                  <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
-                    <thead><tr style="background:#f3f4f6;">
-                      <th style="padding:9px 12px;text-align:left;font-size:11px;color:#374151;">#</th>
-                      <th style="padding:9px 12px;text-align:left;font-size:11px;color:#374151;">Status</th>
-                      <th style="padding:9px 12px;text-align:left;font-size:11px;color:#374151;">Response Body</th>
-                    </tr></thead>
-                    <tbody>{rows}</tbody>
-                  </table>'''
-          except:
-              pass
-
-          # ── HTML ─────────────────────────────────────────────────
-          html = f'''<!DOCTYPE html>
-          <html lang="id">
-          <head>
-            <meta charset="UTF-8"/>
-            <style>
-              @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-              * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-              body {{ font-family: Inter, sans-serif; color: #111827; background: white; font-size: 12px; line-height: 1.6; }}
-              .page {{ padding: 40px 48px; max-width: 900px; margin: 0 auto; }}
-              .metric-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 6px; }}
-              .metric-grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
-              table {{ width: 100%; border-collapse: collapse; }}
-              ul {{ padding-left: 18px; }}
-              @page {{ margin: 0; size: A4; }}
-            </style>
-          </head>
-          <body>
-          <div class="page">
-
-            <!-- COVER HEADER -->
-            <div style="background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 100%);border-radius:12px;padding:36px 40px;margin-bottom:28px;color:white;">
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;opacity:.8;margin-bottom:8px;">Performance Test Report</div>
-              <div style="font-size:26px;font-weight:700;margin-bottom:4px;">API Stress Test</div>
-              <div style="font-size:13px;opacity:.85;margin-bottom:20px;">{d.get("target_url", "-")}</div>
-              <div style="display:flex;gap:32px;font-size:12px;opacity:.9;">
-                <div><span style="opacity:.7;">Tanggal</span><br/><b>{fmt_ts(d.get("timestamp",""))}</b></div>
-                <div><span style="opacity:.7;">Run ID</span><br/><b>{d.get("run_id","-")}</b></div>
-                <div><span style="opacity:.7;">Virtual Users</span><br/><b>{vu} VU</b></div>
-                <div><span style="opacity:.7;">Durasi</span><br/><b>{duration}</b></div>
-              </div>
-            </div>
-
-            <!-- STATUS BANNER -->
-            <div style="background:{status_bg(status)};border:1.5px solid {status_color(status)}30;border-radius:10px;padding:18px 24px;margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;">
-              <div>
-                <div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Overall Status</div>
-                {status_badge(status)}
-              </div>
-              <div style="text-align:right;font-size:12px;color:#374151;">
-                <div style="margin-bottom:2px;"><b>Fail Reasons:</b></div>
-                <div style="color:{status_color(status)};">{d.get("fail_reasons", "-")}</div>
-              </div>
-            </div>
-
-            <!-- SECTION: EXECUTIVE SUMMARY -->
-            {section_title("Executive Summary")}
-            <div class="metric-grid">
-              {metric_card("Total Request", f"{total_req:,}")}
-              {metric_card("Success Rate", f"{success_rate}", "%")}
-              {metric_card("Req / Second", rps)}
-              {metric_card("Concurrent Users", vu, "VU")}
-            </div>
-
-            <!-- PAGE BREAK -->
-            <div style="page-break-before:always;"></div>
-
-            <!-- SECTION: RESPONSE TIME -->
-            {section_title("Response Time")}
-            <div class="metric-grid">
-              {metric_card("Average", f"{avg:.0f}", "ms", "Rata-rata semua request")}
-              {metric_card("P95", f"{p95:.0f}", "ms", "95% request di bawah nilai ini")}
-              {metric_card("P99", f'{float(d.get("p99_response_ms",0)):.0f}', "ms", "99% request di bawah nilai ini")}
-              {metric_card("Max", f'{float(d.get("max_response_ms",0)):.0f}', "ms", "Request terlama")}
-            </div>
-            <div style="margin-top:12px;">
-            <table style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
-              <thead><tr style="background:#f3f4f6;">
-                <th style="padding:9px 14px;text-align:left;font-size:11px;color:#374151;">Metric</th>
-                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Value</th>
-                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Threshold</th>
-                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Status</th>
-              </tr></thead>
-              <tbody>
-                <tr style="border-bottom:1px solid #f3f4f6;">
-                  <td style="padding:9px 14px;font-size:12px;">P95 Response Time</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{p95:.0f} ms</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 2000 ms</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>' if p95 < 2000 else '<span style="color:#b45309;font-weight:600;">⚠ SLOW</span>'}</td>
-                </tr>
-                <tr style="border-bottom:1px solid #f3f4f6;">
-                  <td style="padding:9px 14px;font-size:12px;">P99 Response Time</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{float(d.get("p99_response_ms",0)):.0f} ms</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 5000 ms</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>' if float(d.get("p99_response_ms",0)) < 5000 else '<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>'}</td>
-                </tr>
-                <tr>
-                  <td style="padding:9px 14px;font-size:12px;">Min Response Time</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{float(d.get("min_response_ms",0)):.0f} ms</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">-</td>
-                  <td style="padding:9px 14px;text-align:right;color:#6b7280;">-</td>
-                </tr>
-              </tbody>
-            </table>
-            </div>
-
-            <!-- SECTION: ERROR BREAKDOWN -->
-            {section_title("Error Breakdown")}
-            <table style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
-              <thead><tr style="background:#f3f4f6;">
-                <th style="padding:9px 14px;text-align:left;font-size:11px;color:#374151;">Error Type</th>
-                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Count</th>
-                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Rate</th>
-                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Threshold</th>
-                <th style="padding:9px 14px;text-align:right;font-size:11px;color:#374151;">Status</th>
-              </tr></thead>
-              <tbody>
-                {table_row("Timeout (0)", f'{d.get("timeout_count",0)} req', float(d.get("timeout_rate_pct",0)) > 2)}
-                <tr style="border-bottom:1px solid #f3f4f6;">
-                  <td style="padding:9px 14px;font-size:12px;">Timeout (0)</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{d.get("timeout_count",0)}</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{d.get("timeout_rate_pct","0")}%</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 2%</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>' if float(d.get("timeout_rate_pct",0)) >= 2 else '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'}</td>
-                </tr>
-                <tr style="border-bottom:1px solid #f3f4f6;">
-                  <td style="padding:9px 14px;font-size:12px;">4xx Client Error</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{d.get("error_4xx_count",0)}</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{d.get("error_rate_pct","0")}%</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 5%</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>' if float(d.get("error_rate_pct",0)) >= 5 else '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'}</td>
-                </tr>
-                <tr>
-                  <td style="padding:9px 14px;font-size:12px;">5xx Server Error</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{d.get("error_5xx_count",0)}</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;">{d.get("error_rate_pct","0")}%</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 2%</td>
-                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#b91c1c;font-weight:600;">✗ FAIL</span>' if int(d.get("error_5xx_count",0)) > 0 else '<span style="color:#1a7a4a;font-weight:600;">✓ OK</span>'}</td>
-                </tr>
-              </tbody>
-            </table>
-
-            {error_sample_html}
-
-            <!-- PAGE BREAK -->
-            <div style="page-break-before:always;"></div>
-
-            <!-- SECTION: KESIMPULAN -->
-            {section_title("Kesimpulan")}
-            <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:20px;">
-              <ul style="color:#374151;font-size:12px;">
-                {conclusions_html}
-              </ul>
-            </div>
-
-            <!-- SECTION: REKOMENDASI -->
-            {section_title("Rekomendasi")}
-            <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px 20px;margin-bottom:28px;">
-              <ul style="color:#1e40af;font-size:12px;">
-                {recommends_html}
-              </ul>
-            </div>
-
-            <!-- FOOTER -->
-            <div style="border-top:1px solid #e5e7eb;padding-top:14px;display:flex;justify-content:space-between;font-size:10px;color:#9ca3af;">
-              <div>Generated by GitHub Actions · Run ID: {d.get("run_id","-")}</div>
-              <div>API Stress Test Report · {fmt_ts(d.get("timestamp",""))}</div>
-            </div>
-
-          </div>
+          html = f"""
+          <html>
+          <body style='font-family: Arial'>
+            <h1>API Stress Test Report</h1>
+            <p><b>Target:</b> {d.get("target_url","-")}</p>
+            <p><b>Status:</b> {d.get("status","-")}</p>
+            <p><b>Run ID:</b> {os.environ.get("RUN_ID")}</p>
+            <p><b>Run URL:</b> {os.environ.get("RUN_URL")}</p>
+            <hr/>
+            <pre>{json.dumps(d, indent=2)}</pre>
           </body>
-          </html>'''
+          </html>
+          """
 
-          with open('report.html', 'w') as f:
+          with open("report.html","w") as f:
               f.write(html)
 
-          HTML(filename='report.html').write_pdf('stress-test-report.pdf')
-          print("✅ PDF report generated: stress-test-report.pdf")
+          HTML("report.html").write_pdf("stress-test-report.pdf")
+          print("PDF generated")
           PYEOF
 
-      - name: 📊 Upload hasil sebagai artifact
+      - name: 📊 Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stress-test-results-${{ github.run_id }}
+          name: stress-test-${{ github.run_id }}
           path: |
             summary.json
             k6_output.txt
             stress-test-report.pdf
-          retention-days: 30
 
-      - name: 📤 Kirim hasil ke Google Sheet
+      - name: 📤 Send to Google Sheet
         if: always()
         env:
-          SHEET_WEBHOOK_URL: ${{ secrets.GOOGLE_SHEET_WEBHOOK_URL }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WEBHOOK: ${{ secrets.GOOGLE_SHEET_WEBHOOK_URL }}
         run: |
           python3 - << 'PYEOF'
           import json, os, urllib.request
 
-          with open('summary.json', 'r') as f:
-            data = json.load(f)
-
-          data['run_id']  = os.environ['RUN_ID']
-          data['run_url'] = os.environ['RUN_URL']
-
-          payload = json.dumps(data).encode('utf-8')
-          webhook = os.environ['SHEET_WEBHOOK_URL']
+          with open("summary.json") as f:
+              data = json.load(f)
 
           req = urllib.request.Request(
-            webhook,
-            data=payload,
-            headers={'Content-Type': 'application/json'},
-            method='POST'
+              os.environ["WEBHOOK"],
+              data=json.dumps(data).encode(),
+              headers={"Content-Type": "application/json"}
           )
-          with urllib.request.urlopen(req) as resp:
-            print(f"Sheet webhook response: {resp.status}")
+
+          urllib.request.urlopen(req)
+          print("Sent to Google Sheet")
           PYEOF
 
       - name: ✅ Print Summary
         if: always()
         run: |
-          echo "=============================="
-          echo "  STRESS TEST SUMMARY"
-          echo "=============================="
-          python3 -m json.tool summary.json || cat summary.json
+          cat summary.json

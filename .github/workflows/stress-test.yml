@@ -161,7 +161,9 @@ jobs:
           # ── metrics ───────────────────────────────────────────────
           status       = d.get('status', 'FAIL')
           p95          = float(d.get('p95_response_ms', 0))
-          p99          = float(d.get('p99_response_ms', 0))
+          p99_raw      = float(d.get('p99_response_ms', 0))
+          p99          = p99_raw if p99_raw > 0 else 0
+          p99_display  = f'{p99_raw:.0f}' if p99_raw > 0 else 'N/A'
           avg          = float(d.get('avg_response_ms', 0))
           min_ms       = float(d.get('min_response_ms', 0))
           max_ms       = float(d.get('max_response_ms', 0))
@@ -227,7 +229,7 @@ jobs:
               recommends.append('Cek apakah HPA sudah scale-up ke maxReplicas: 5 selama test berlangsung. Jika belum, review HPA metrics dan targetCPUUtilizationPercentage.')
               recommends.append('Monitor JVM metrics (heap, GC pause, thread count) menggunakan Actuator + Prometheus saat test berlangsung.')
               recommends.append(f'Turunkan VU ke 20–30 dan uji ulang untuk menemukan batas aman sebelum server mulai timeout.')
-              recommends.append('Pertimbangkan tuning <b>HikariCP connection pool</b> di Spring Boot — default maximumPoolSize=10 bisa jadi bottleneck di {vu} VU.')
+              recommends.append(f'Pertimbangkan tuning <b>HikariCP connection pool</b> di Spring Boot — default maximumPoolSize=10 bisa jadi bottleneck di {vu} VU.')
               recommends.append('Jika timeout terjadi sebelum scale-up sempat berjalan, pertimbangkan menaikkan minReplicas dari 2 ke 3 untuk baseline capacity yang lebih tinggi.')
 
           conclusions_html = ''.join(f'<li style="margin-bottom:8px;">{c}</li>' for c in conclusions)
@@ -271,7 +273,9 @@ jobs:
               .metric-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 6px; }}
               .metric-grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
               table {{ width: 100%; border-collapse: collapse; }}
-              ul {{ padding-left: 18px; }}
+              ul {{ padding-left: 0; list-style: none; }}
+              ul li {{ padding-left: 16px; position: relative; }}
+              ul li::before {{ content: "•"; position: absolute; left: 0; color: currentColor; }}
               @page {{ margin: 0; size: A4; }}
             </style>
           </head>
@@ -349,15 +353,12 @@ jobs:
               {metric_card("Concurrent Users", vu, "VU")}
             </div>
 
-            <!-- PAGE BREAK -->
-            <div style="page-break-before:always;"></div>
-
             <!-- RESPONSE TIME -->
             {section_title("Response Time")}
             <div class="metric-grid">
               {metric_card("Average", f"{avg:.0f}", "ms", "Rata-rata semua request")}
               {metric_card("P95", f"{p95:.0f}", "ms", "95% request di bawah nilai ini")}
-              {metric_card("P99", f"{p99:.0f}", "ms", "99% request di bawah nilai ini")}
+              {metric_card("P99", p99_display, "ms", "99% request di bawah nilai ini")}
               {metric_card("Max", f"{max_ms:.0f}", "ms", "Request terlama")}
             </div>
             <div style="margin-top:12px;">
@@ -389,9 +390,9 @@ jobs:
                 </tr>
                 <tr>
                   <td style="padding:9px 14px;font-size:12px;">P99 Response Time</td>
-                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{p99:.0f} ms</td>
+                  <td style="padding:9px 14px;font-size:12px;text-align:right;font-weight:600;">{p99_display} ms</td>
                   <td style="padding:9px 14px;font-size:12px;text-align:right;color:#6b7280;">&lt; 5000 ms</td>
-                  <td style="padding:9px 14px;text-align:right;">{threshold_status(p99, 5000)}</td>
+                  <td style="padding:9px 14px;text-align:right;">{'<span style="color:#6b7280;">N/A</span>' if p99_raw == 0 else threshold_status(p99, 5000)}</td>
                 </tr>
               </tbody>
             </table>
